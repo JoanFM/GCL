@@ -20,6 +20,79 @@ from scipy.stats import entropy, wasserstein_distance
 from time import perf_counter
 import pdb
 
+from transformers import AutoModel, AutoTokenizer
+from transformers import Blip2Processor, Blip2ForConditionalGeneration
+import torch
+
+MODEL_NAME = 'jinaai/jina-embeddings-v2-base-en'
+BLIP2_MODEL_NAME = "Salesforce/blip2-flan-t5-xl"
+PROMPT = 'Describe this image in detail.'
+
+
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output[0]
+    input_mask_expanded = (
+        attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    )
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(
+        input_mask_expanded.sum(1), min=1e-9
+    )
+
+
+class JinaModel:
+
+    def __init__(self, device='cpu', *args, **kwargs):
+        self.device = device
+        self.text_encoder = AutoModel.from_pretrained(
+            MODEL_NAME, trust_remote_code=True
+        )
+        self.text_encoder.to(device)
+        self.text_encoder.eval()
+
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        self.processor = Blip2Processor.from_pretrained(BLIP2_MODEL_NAME)
+        self.blip_model = Blip2ForConditionalGeneration.from_pretrained(
+            BLIP2_MODEL_NAME, torch_dtype=torch.float16
+        )
+        self.blip_model.to(device)
+        self.blip_model.eval()
+
+    def eval(self):
+        self.text_encoder.eval()
+        self.blip_model.eval()
+
+    def encode_text(self, batch_tokens):
+        batch_encoded_input = self.tokenizer.pad(
+            {'input_ids': batch_tokens['input_ids']},
+            return_tensors="pt",
+        ).to(self.device)
+        batch_model_output = self.text_encoder(**batch_encoded_input)
+        embeddings = mean_pooling(
+            batch_model_output, batch_encoded_input["attention_mask"]
+        )
+        return embeddings
+
+    def encode_image(self, batch_images):
+        for k in batch_images.keys():
+            batch_images[k] = batch_images[k].squeeze(1).to(self.device)
+        generated_ids = self.blip_model.generate(**batch_images, max_new_tokens=8192)
+        generated_text = [text.strip() for text in self.processor.batch_decode(generated_ids, skip_special_tokens=True)]
+        embeddings = self.text_encoder.encode(generated_text, convert_to_tensor=True)
+        return embeddings
+
+
+def load_jina_almost_clip(device="cpu", *args, **kwargs):
+    """return transform: torchvision transform applied to images,
+        model: torch.nn.Module
+        CLIP-like model with `encode_image` and `encode_text`"""
+
+    model = JinaModel(device=device)
+
+    def transform(*args, **kwargs):
+        return model.processor(text=PROMPT, return_tensors="pt", *args, **kwargs)
+
+    return model, transform, model.tokenizer
+
 
 def calculate_individual_err(qrels, retrieved_results):
     # Initialize ERR for the query
@@ -72,7 +145,7 @@ def calculate_individual_rbp(qrels, retrieved_results, p):
         rel_norm = rel / max_rel
         # Update RBP
         RBP += rel_norm * (p ** (rank - 1))
-    RBP *= (1-p)
+    RBP *= (1 - p)
     return RBP
 
 
@@ -118,7 +191,8 @@ def calc_all_features_mf(model, doc_meta_list, preprocess, args):
                     right_features.append(model.encode_image(rights[j], normalize=True))
 
         right_features = torch.stack(right_features, dim=1)
-        right_features_mean = (right_features * right_weights.unsqueeze(-1).repeat(1, 1, right_features.shape[-1]).to(device=right_features.device, dtype=right_features.dtype)).sum(1)
+        right_features_mean = (right_features * right_weights.unsqueeze(-1).repeat(1, 1, right_features.shape[-1]).to(
+            device=right_features.device, dtype=right_features.dtype)).sum(1)
         right_features_mean = F.normalize(right_features_mean, dim=-1)
         all_features += right_features_mean
         # start_time = perf_counter()
@@ -186,10 +260,10 @@ if __name__ == "__main__":
     parser.add_argument("--test_csv", type=str, default=None)
     parser.add_argument("--doc-meta", type=str, default=None)
     parser.add_argument("--pretrained", type=str)
-    parser.add_argument("--model_name", type=str, help="Model type", default="ViT-B-32")
+    parser.add_argument("--model_name", type=str, help="Model type", default="jina-almost-clip")
     parser.add_argument("--overwrite-feature", action="store_true", default=False)
     parser.add_argument("--overwrite-retrieval", action="store_true", default=False)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--weight_key", default="score")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--output-dir", type=str)
@@ -208,8 +282,6 @@ if __name__ == "__main__":
     parser.add_argument("--doc-id-key", type=str, default="product_id")
     parser.add_argument("--metric-only", action="store_true", default=False)
 
-
-
     args = parser.parse_args()
 
     if not os.path.exists(args.output_dir):
@@ -221,7 +293,6 @@ if __name__ == "__main__":
     if not args.gt_results_path:
         args.gt_results_path = os.path.join(args.output_dir, "gt_results.json")
 
-
     process_multi_modal_args(args)
     args.context_length = args.context_length[0][0]
 
@@ -230,20 +301,19 @@ if __name__ == "__main__":
         pretrained = args.pretrained
         print(pretrained, model_name)
 
-        model, preprocess, tokenizer = load_model(model_name, pretrained)
-        model = model.to('cuda')
-
+        model, preprocess, tokenizer = load_jina_almost_clip(device='cuda:1')
+        # model = model.to('cuda:1')
 
         print("loading df test")
         df_test = pd.read_csv(args.test_csv)
         print(df_test)
 
-        df_test[args.weight_key] = (((df_test[args.weight_key] - df_test[args.weight_key].min()) / (df_test[args.weight_key].max() - df_test[args.weight_key].min())) * 99 + 1).astype(int)
+        df_test[args.weight_key] = (((df_test[args.weight_key] - df_test[args.weight_key].min()) / (
+                    df_test[args.weight_key].max() - df_test[args.weight_key].min())) * 99 + 1).astype(int)
         # get the test queries
         test_queries = get_test_queries(df_test, top_q=args.top_q, weight_key=args.weight_key)
 
         df_test.set_index("query")
-
 
         df_test = df_test.set_index('query')
         df_test[args.doc_id_key] = df_test[args.doc_id_key].astype(str)
@@ -268,7 +338,6 @@ if __name__ == "__main__":
             all_features = torch.stack(all_features).to('cuda')
             print(all_features.shape, all_features.dtype)
 
-
     # Get Ground truth Results
     if os.path.exists(args.gt_results_path):
         print("Loading Ground Truth")
@@ -280,7 +349,8 @@ if __name__ == "__main__":
         gt_results = {}
         for query in tqdm(test_queries):
             _df_query = df_test.loc[[query]].sort_values(by=args.weight_key, ascending=False)
-            relevant_docs, relevance = _df_query[args.doc_id_key][:1000].tolist(), _df_query[args.weight_key][:1000].tolist()
+            relevant_docs, relevance = _df_query[args.doc_id_key][:1000].tolist(), _df_query[args.weight_key][
+                                                                                   :1000].tolist()
             gt_results[query] = {doc: round(rel) for doc, rel in zip(relevant_docs, relevance)}
         with open(args.gt_results_path, "w") as f:
             json.dump(gt_results, f)
@@ -294,7 +364,6 @@ if __name__ == "__main__":
         retrieval_results = _run_queries(test_queries, doc_ids_all, all_features, tokenizer, model, 1000, args)
         with open(args.retrieval_path, "w") as f:
             json.dump(retrieval_results, f)
-
 
     # Evaluation Starts
     print("Evaluation Starts")
